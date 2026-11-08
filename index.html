@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>打磚塊</title>
+<style>
+  :root { --bg:#16213a; --panel:#0f1830; --text:#eef2ff; --muted:#9aa7c7; --accent:#ffd166; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--panel); color:var(--text);
+    font-family:"Noto Sans TC","PingFang TC","Microsoft JhengHei",sans-serif; }
+  body { display:flex; justify-content:center; }
+  #wrap { position:relative; width:100%; max-width:480px; align-self:flex-start; }
+  canvas { display:block; width:100%; background:var(--bg); touch-action:none; }
+  #overlay { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:10px; padding:20px; text-align:center; background:rgba(15,24,48,.92); }
+  #overlay.hidden { display:none; }
+  h1 { margin:0; font-size:2rem; }
+  p { margin:0; color:var(--muted); }
+  button { font:inherit; font-weight:700; padding:10px 22px; border:0; border-radius:8px;
+    background:var(--accent); color:#222; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  button:focus-visible, input:focus-visible { outline:3px solid #fff; outline-offset:2px; }
+  input { font:inherit; padding:9px 12px; border-radius:8px; border:2px solid #34456f;
+    background:var(--bg); color:var(--text); width:70%; text-align:center; }
+  #board { list-style:none; margin:4px 0 0; padding:0; width:80%; text-align:left; font-size:.95rem; }
+  #board li { display:flex; justify-content:space-between; padding:3px 0; border-bottom:1px solid #26365c; }
+  #board li span:first-child { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .hide { display:none; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="480" height="640"></canvas>
+  <div id="overlay">
+    <h1 id="title">打磚塊</h1>
+    <p id="sub">移動手指或滑鼠控制擋板</p>
+    <div id="submitBox" class="hide">
+      <input id="nameInput" maxlength="12" placeholder="輸入你的名字" autocomplete="off">
+      <div style="height:8px"></div>
+      <button id="submitBtn">送出分數</button>
+    </div>
+    <p id="status"></p>
+    <ol id="board"></ol>
+    <button id="startBtn">開始遊戲</button>
+  </div>
+</div>
+
+<script>
+// ===== Supabase 設定：填入你的專案網址和 anon public key =====
+const SUPABASE_URL = "";   // 例如 "https://abcdxyz.supabase.co"
+const SUPABASE_KEY = "";   // Project Settings > API 裡的 anon public key
+// ============================================================
+
+const hasDB = SUPABASE_URL !== "" && SUPABASE_KEY !== "";
+const dbHeaders = { apikey: SUPABASE_KEY, Authorization: "Bearer " + SUPABASE_KEY, "Content-Type": "application/json" };
+
+async function loadBoard() {
+  const list = document.getElementById("board");
+  list.innerHTML = "";
+  if (!hasDB) { document.getElementById("status").textContent = "尚未設定排行榜（見檔案最上方）"; return; }
+  try {
+    const r = await fetch(SUPABASE_URL + "/rest/v1/scores?select=name,score&order=score.desc&limit=10", { headers: dbHeaders });
+    if (!r.ok) throw new Error(r.status);
+    const rows = await r.json();
+    if (rows.length === 0) { document.getElementById("status").textContent = "還沒有人上榜，你當第一名！"; return; }
+    rows.forEach((row, i) => {
+      const li = document.createElement("li");
+      const a = document.createElement("span"); a.textContent = (i + 1) + ". " + row.name;
+      const b = document.createElement("span"); b.textContent = row.score;
+      li.append(a, b); list.appendChild(li);
+    });
+  } catch (e) { document.getElementById("status").textContent = "排行榜讀取失敗"; }
+}
+
+async function submitScore(name, score) {
+  const r = await fetch(SUPABASE_URL + "/rest/v1/scores", {
+    method: "POST", headers: { ...dbHeaders, Prefer: "return=minimal" },
+    body: JSON.stringify({ name: name, score: score })
+  });
+  if (!r.ok) throw new Error(r.status);
+}
+
+// ===== 遊戲 =====
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const W = canvas.width, H = canvas.height;
+const COLS = 8, ROWS = 6, GAP = 4, MARGIN = 10, TOP = 70, BH = 20;
+const BW = (W - MARGIN * 2 - GAP * (COLS - 1)) / COLS;
+const COLORS = ["#ff7096", "#ffb703", "#ffd166", "#4cc9f0", "#6c8cff", "#a78bfa"];
+
+const paddle = { x: W / 2 - 45, y: H - 40, w: 90, h: 12 };
+const ball = { x: 0, y: 0, r: 8, vx: 0, vy: 0 };
+let bricks = [], score = 0, lives = 3, level = 1, speed = 5, state = "menu"; // menu | ready | play | over
+
+function buildBricks() {
+  bricks = [];
+  for (let r = 0; r < ROWS; r++)
+    for (let c = 0; c < COLS; c++)
+      bricks.push({ x: MARGIN + c * (BW + GAP), y: TOP + r * (BH + GAP), alive: true, color: COLORS[r] });
+}
+function resetBall() {
+  ball.x = paddle.x + paddle.w / 2; ball.y = paddle.y - ball.r - 1; ball.vx = 0; ball.vy = 0;
+}
+function newGame() {
+  score = 0; lives = 3; level = 1; speed = 5;
+  buildBricks(); resetBall(); state = "ready";
+}
+function launch() {
+  const a = (Math.random() * 60 - 30) * Math.PI / 180;
+  ball.vx = speed * Math.sin(a); ball.vy = -speed * Math.cos(a); state = "play";
+}
+
+function update() {
+  if (state === "ready") { resetBall(); return; }
+  if (state !== "play") return;
+  const px = ball.x, py = ball.y;
+  ball.x += ball.vx; ball.y += ball.vy;
+
+  if (ball.x < ball.r) { ball.x = ball.r; ball.vx = Math.abs(ball.vx); }
+  if (ball.x > W - ball.r) { ball.x = W - ball.r; ball.vx = -Math.abs(ball.vx); }
+  if (ball.y < ball.r) { ball.y = ball.r; ball.vy = Math.abs(ball.vy); }
+
+  // 擋板：依擊中位置改變反彈角度
+  if (ball.vy > 0 && ball.y + ball.r >= paddle.y && ball.y - ball.r <= paddle.y + paddle.h &&
+      ball.x >= paddle.x - ball.r && ball.x <= paddle.x + paddle.w + ball.r) {
+    const hit = (ball.x - (paddle.x + paddle.w / 2)) / (paddle.w / 2); // -1 ~ 1
+    const a = hit * 65 * Math.PI / 180;
+    ball.vx = speed * Math.sin(a); ball.vy = -speed * Math.cos(a);
+    ball.y = paddle.y - ball.r;
+  }
+
+  // 磚塊：一次只處理一塊
+  for (const b of bricks) {
+    if (!b.alive) continue;
+    const cx = Math.max(b.x, Math.min(ball.x, b.x + BW));
+    const cy = Math.max(b.y, Math.min(ball.y, b.y + BH));
+    if ((ball.x - cx) ** 2 + (ball.y - cy) ** 2 <= ball.r ** 2) {
+      b.alive = false; score += 10;
+      if (px >= b.x && px <= b.x + BW) ball.vy = -ball.vy; else ball.vx = -ball.vx;
+      break;
+    }
+  }
+
+  // 過關
+  if (bricks.every(b => !b.alive)) { level++; speed += 0.7; buildBricks(); resetBall(); state = "ready"; return; }
+
+  // 掉到底部
+  if (ball.y - ball.r > H) {
+    lives--;
+    if (lives <= 0) { gameOver(); } else { resetBall(); state = "ready"; }
+  }
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  for (const b of bricks) { if (!b.alive) continue; ctx.fillStyle = b.color; ctx.fillRect(b.x, b.y, BW, BH); }
+  ctx.fillStyle = "#eef2ff"; ctx.fillRect(paddle.x, paddle.y, paddle.w, paddle.h);
+  ctx.beginPath(); ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#9aa7c7"; ctx.font = "18px sans-serif";
+  ctx.textAlign = "left"; ctx.fillText("分數 " + score, 12, 28);
+  ctx.textAlign = "center"; ctx.fillText("第 " + level + " 關", W / 2, 28);
+  ctx.textAlign = "right"; ctx.fillText("生命 " + "♥".repeat(Math.max(lives, 0)), W - 12, 28);
+  if (state === "ready") { ctx.textAlign = "center"; ctx.fillStyle = "#ffd166"; ctx.fillText("點一下發球", W / 2, H / 2 + 60); }
+}
+
+function loop() { update(); draw(); requestAnimationFrame(loop); }
+
+// ===== 操作與畫面 =====
+function movePaddle(e) {
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * (W / rect.width);
+  paddle.x = Math.max(0, Math.min(W - paddle.w, x - paddle.w / 2));
+}
+canvas.addEventListener("pointermove", movePaddle);
+canvas.addEventListener("pointerdown", (e) => { movePaddle(e); if (state === "ready") launch(); });
+
+const overlay = document.getElementById("overlay");
+const submitBox = document.getElementById("submitBox");
+const nameInput = document.getElementById("nameInput");
+const submitBtn = document.getElementById("submitBtn");
+const statusEl = document.getElementById("status");
+const startBtn = document.getElementById("startBtn");
+
+function gameOver() {
+  state = "over";
+  document.getElementById("title").textContent = "遊戲結束";
+  document.getElementById("sub").textContent = "你的分數：" + score;
+  statusEl.textContent = "";
+  startBtn.textContent = "再玩一次";
+  if (hasDB && score > 0) {
+    submitBox.classList.remove("hide"); submitBtn.disabled = false;
+    try { nameInput.value = localStorage.getItem("breakoutName") || ""; } catch (e) {}
+  } else { submitBox.classList.add("hide"); }
+  overlay.classList.remove("hidden");
+  loadBoard();
+}
+
+submitBtn.addEventListener("click", async () => {
+  const name = nameInput.value.trim().slice(0, 12);
+  if (!name) { statusEl.textContent = "請先輸入名字"; return; }
+  submitBtn.disabled = true;
+  try {
+    try { localStorage.setItem("breakoutName", name); } catch (e) {}
+    await submitScore(name, score);
+    submitBox.classList.add("hide");
+    await loadBoard();
+  } catch (e) { statusEl.textContent = "送出失敗，請再試一次"; submitBtn.disabled = false; }
+});
+
+startBtn.addEventListener("click", () => {
+  overlay.classList.add("hidden"); submitBox.classList.add("hide"); newGame();
+});
+
+buildBricks(); resetBall(); loadBoard(); loop();
+</script>
+</body>
+</html>
